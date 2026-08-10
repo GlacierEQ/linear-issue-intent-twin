@@ -1,0 +1,12 @@
+{
+  "schema": "glaciereq.repo-capabilities.v1",
+  "repository": "GlacierEQ/linear-issue-intent-twin",
+  "capabilities": [
+    {
+      "id": "issue-intent-twin",
+      "name": "Issue Intent Twin",
+      "status": "SCAFFOLD",
+      "module": "src/issue_intent_twin.py"
+    }
+  ]
+}
