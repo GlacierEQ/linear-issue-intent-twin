@@ -1,7 +1,7 @@
 [project]
 name = "linear-issue-intent-twin"
-version = "0.0.1"
-description = "Scaffold: Issue Intent Twin (independent Linear lens)"
+version = "1.0.0"
+description = "Executable issue acceptance predicates and merge-blocking intent receipts"
 requires-python = ">=3.11"
 dependencies = []
 
