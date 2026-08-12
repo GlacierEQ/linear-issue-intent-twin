@@ -1,154 +1,114 @@
 from __future__ import annotations
-import importlib
-import inspect
-import unittest
-import sys
-from pathlib import Path
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "src"))
 
-class AdversarialEliteTests(unittest.TestCase):
-    def _load(self):
-        errors = []
-        for name in ('issue_intent_twin', "src." + 'issue_intent_twin'):
-            try:
-                return importlib.import_module(name)
-            except Exception as e:
-                errors.append(f"{name}: {e}")
-        self.fail("; ".join(errors))
+import pytest
 
-    def test_module_importable(self):
-        mod = self._load()
-        public = [n for n in dir(mod) if not n.startswith("_")]
-        self.assertGreater(len(public), 0, "module exposes no public names")
+from issue_intent_twin import (
+    Decision,
+    IntentSchemaError,
+    IssueIntentTwin,
+    IssueIntentTwinRequest,
+)
 
-    def test_refuse_bad_import_path_does_not_shadow(self):
-        with self.assertRaises(ModuleNotFoundError):
-            importlib.import_module("src.__elite_does_not_exist_" + 'issue_intent_twin')
 
-    def test_central_mechanism_refuse_or_edge(self):
-        """Exercise shipped refuse/edge paths when present; never crash open."""
-        mod = self._load()
-        exercised = False
+NOW = 1_800_000_000.0
 
-        # plan(connector, action) refuse nonsense connector
-        for cname, cls in inspect.getmembers(mod, inspect.isclass):
-            if cname.startswith("_"):
-                continue
-            # include re-exported central classes (not pure stdlib typing)
-            mname = getattr(cls, "__module__", None) or ""
-            if mname.startswith("typing") or mname in {"builtins", "collections", "pathlib", "json", "sys", "os"}:
-                continue
-            if getattr(mod, cname, None) is not cls and mname not in {mod.__name__, getattr(mod, "__package__", None)}:
-                continue
-            try:
-                sig = inspect.signature(cls)
-                if any(
-                    p.default is inspect.Parameter.empty and p.name != "self"
-                    and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
-                    for p in sig.parameters.values()
-                ):
-                    continue
-                inst = cls()
-            except Exception:
-                continue
-            plan = getattr(inst, "plan", None)
-            if callable(plan):
-                try:
-                    out = plan("__elite_no_such_connector__", "delete")
-                    self.assertIsNotNone(out)
-                    if isinstance(out, dict):
-                        # refuse should not silently allow destructive unknown work
-                        allowed = out.get("allowed")
-                        if allowed is True:
-                            self.assertTrue(
-                                out.get("human_approved") is True
-                                or out.get("status") in {"REFUSED", "DENIED", "ERROR", "UNKNOWN"},
-                                f"plan allowed unknown connector: {out!r}",
-                            )
-                        exercised = True
-                    else:
-                        exercised = True
-                except Exception as e:
-                    # hard fail-closed is acceptable refuse
-                    exercised = True
-                    self.assertIsInstance(e, Exception)
-            # authorize/decide refuse
-            for meth in ("authorize", "decide", "check"):
-                fn = getattr(inst, meth, None)
-                if not callable(fn):
-                    continue
-                try:
-                    ps = inspect.signature(fn)
-                    req = [
-                        p for p in ps.parameters.values()
-                        if p.name != "self" and p.default is inspect.Parameter.empty
-                        and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
-                    ]
-                    if req:
-                        continue
-                    out = fn()
-                    self.assertIsNotNone(out)
-                    exercised = True
-                except TypeError:
-                    continue
-                except Exception:
-                    exercised = True
 
-        # module-level schedule([]) / health edges
-        sched = getattr(mod, "schedule", None)
-        if callable(sched):
-            try:
-                out = sched([], 1.0)
-                self.assertIsInstance(out, dict)
-                self.assertIn("plan", out)
-                exercised = True
-            except TypeError:
-                try:
-                    out = sched([])
-                    self.assertIsNotNone(out)
-                    exercised = True
-                except Exception:
-                    exercised = True
-            except Exception:
-                exercised = True
+def _evaluate(intent, candidate):
+    return IssueIntentTwin().evaluate(
+        IssueIntentTwinRequest(
+            subject_id="issue",
+            payload={"intent": intent, "candidate": candidate},
+            budget=1.0,
+        ),
+        now=NOW,
+    )
 
-        for edge_fn, args in (
-            ("anomaly_score", (1e9,)),
-            ("thermal_margin", (-40.0,)),
-            ("simulate_rack", (0, 0.0)),
-        ):
-            fn = getattr(mod, edge_fn, None)
-            if not callable(fn):
-                continue
-            try:
-                out = fn(*args)
-                self.assertIsNotNone(out)
-                exercised = True
-            except Exception:
-                exercised = True
 
-        # metrics / efficiency attributes on zero-arg engines
-        for cname, cls in inspect.getmembers(mod, inspect.isclass):
-            if cname.startswith("_"):
-                continue
-            try:
-                inst = cls()
-            except Exception:
-                continue
-            metrics = getattr(inst, "metrics", None)
-            if isinstance(metrics, dict) and metrics:
-                self.assertIn(next(iter(metrics)), metrics)
-                exercised = True
-                break
+def test_empty_intent_cannot_approve_anything() -> None:
+    receipt = _evaluate({}, {"observations": {}, "tests": {}, "receipts": {}})
+    assert receipt.decision is Decision.REFUSE
+    assert "intent_has_no_acceptance_conditions" in receipt.reasons
 
-        if not exercised:
-            # last resort: public API still rejects nonsense attribute assignment theater
-            public = [n for n in dir(mod) if not n.startswith("_")]
-            self.assertGreater(len(public), 0)
-            with self.assertRaises((AttributeError, TypeError, ImportError, ValueError, KeyError)):
-                getattr(mod, "__elite_missing_surface__")
 
-if __name__ == "__main__":
-    unittest.main()
+def test_missing_observation_does_not_compare_as_none_success() -> None:
+    intent = {
+        "requirements": [
+            {"id": "missing", "path": "never.present", "op": "eq", "value": None}
+        ]
+    }
+    receipt = _evaluate(
+        intent,
+        {"observations": {}, "tests": {}, "receipts": {}, "cost": 0},
+    )
+    assert receipt.decision is Decision.REFUSE
+    assert "requirement_failed:missing" in receipt.reasons
+
+
+def test_predicate_evidence_cannot_be_omitted() -> None:
+    intent = {
+        "requirements": [
+            {
+                "id": "verified",
+                "path": "result.ok",
+                "op": "truthy",
+                "receipt": "runtime-proof",
+            }
+        ]
+    }
+    receipt = _evaluate(
+        intent,
+        {
+            "observations": {"result": {"ok": True}},
+            "tests": {},
+            "receipts": {},
+            "cost": 0,
+        },
+    )
+    assert receipt.decision is Decision.REFUSE
+    assert "predicate_receipt_missing:runtime-proof" in receipt.reasons
+
+
+def test_regex_predicate_handles_invalid_pattern_without_crash_open() -> None:
+    intent = {
+        "requirements": [
+            {"id": "pattern", "path": "value", "op": "matches", "value": "["}
+        ]
+    }
+    receipt = _evaluate(
+        intent,
+        {"observations": {"value": "anything"}, "tests": {}, "receipts": {}, "cost": 0},
+    )
+    assert receipt.decision is Decision.REFUSE
+    assert "requirement_failed:pattern" in receipt.reasons
+
+
+def test_duplicate_predicate_ids_are_rejected() -> None:
+    with pytest.raises(IntentSchemaError, match="duplicate"):
+        IssueIntentTwin.compile_intent(
+            {
+                "requirements": [
+                    {"id": "same", "path": "a", "op": "truthy"},
+                    {"id": "same", "path": "b", "op": "truthy"},
+                ]
+            }
+        )
+
+
+def test_negative_candidate_cost_refuses() -> None:
+    receipt = _evaluate(
+        {"required_tests": ["unit"]},
+        {"observations": {}, "tests": {"unit": True}, "receipts": {}, "cost": -1},
+    )
+    assert receipt.decision is Decision.REFUSE
+    assert "candidate_cost_negative" in receipt.reasons
+
+
+def test_non_object_candidate_surfaces_fail_closed() -> None:
+    receipt = _evaluate(
+        {"required_tests": ["unit"]},
+        {"observations": [], "tests": [], "receipts": [], "cost": 0},
+    )
+    assert receipt.decision is Decision.REFUSE
+    assert "candidate_observations_not_object" in receipt.reasons
+    assert "candidate_tests_not_object" in receipt.reasons
+    assert "candidate_receipts_not_object" in receipt.reasons
